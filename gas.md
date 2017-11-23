@@ -42,7 +42,7 @@ operations need to take into account the size of the operands.
 
 The memory variation introduced by updating the register *r* with value *v*
 ```
-  registerLoadDelta(r, v) = limbLength(v) - registerDataSize(r)
+  registerLoadDelta(r, v) = limbLength(v) - registerSize(r)
 ```
 
 ### High level view of the gas model
@@ -381,6 +381,8 @@ We assume that all operations interrogating the local state have complexity
   ```hs
   computationCost(LOCALCALL(_, nARGS, _) _ rARGS) =
     saveContextCost + wordCopyCost * (sum [registerSize r | r <- rARGS]) + jumpCost
+  requiredRegisterMemory (LOCALCALL(_, nARGS, _) _ rARGS) =
+    currentRegisterMemory + sum [registerSize(r) | r <- rVALUES]
   ```
 
 * `RETURN`
