@@ -33,17 +33,17 @@ fixed at 256 bits, now varies during its usage.  This was previously only
 considered for storage (resetting a stored value to 0 would generate a refund).
 
 To address this variance, we charge memory accesses as EVM, but only charge
-memory allocation w.r.t. the peak memory usage. 
+memory allocation w.r.t. the peak memory usage.
+
+Another change brought upon by arbitrary length integers is that arithmetic
+operations need to take into account the size of the operands.
 
 ### Operations with return register
 
 The memory variation introduced by updating the register *r* with value *v*
 ```
-  registerLoadDelta(r, v) = limbLength(v) - registerDataSize(r)
+  registerLoadDelta(r, v) = limbLength(v) - registerSize(r)
 ```
-
-Another change brought upon by arbitrary length integers is that arithmetic
-operations need to take into account the size of the operands.
 
 ### High level view of the gas model
 
@@ -326,7 +326,7 @@ gas/memory) to contain that size.
 We assume that all operations interrogating the local state have complexity
 *localStateCost* and their result fits a machine word.
 
-* `LOCALOP rREG`, where `LOCALOP` in `[PC, GAS, GASPRICE, GASLIMIT, COINBASE, NUMBER, MSIZE, CODESIZE]`
+* `LOCALOP rREG`, where `LOCALOP` in `[GAS, GASPRICE, GASLIMIT, COINBASE, NUMBER, MSIZE, CODESIZE]`
     ```hs
     computationCost(LOCALOP rREG) = localStateCost
     estimatedResultSize(LOCALOP rREG) = 1
@@ -336,7 +336,7 @@ We assume that all operations interrogating the local state have complexity
     computationCost(LOCALOP rREG) = localStateCost + addressSize*copyWordCost
     estimatedResultSize(LOCALOP rREG) = addressSize
     ```
-* `TMESTAMP rREG`
+* `TIMESTAMP rREG`
     ```hs
     computationCost(LOCALOP rREG) = localStateCost + timeStampSize*copyWordCost
     estimatedResultSize(LOCALOP rREG) = timeStampSize
@@ -376,10 +376,29 @@ We assume that all operations interrogating the local state have complexity
   Save the local context (including the current register stack memory
   requirements), copy the arguments into the new context and jump to
   the call site.
+
+  We're assuming that, in an efficient implementation, saving the caller's
+  registers is a small constant time operation. One way or another, an
+  efficient implementation will, in the general case, hold the actual register
+  data in memory, while, maybe, using machine registers for the machine
+  metadata. Regardless of how these optimizations are done, saving the caller
+  context and creating the callee context takes
+  constantTime + someConstant * registerCount, and a similar amount of memory.
+
   ```hs
   computationCost(LOCALCALL(_, nARGS, _) _ rARGS) =
-    saveContextCost + wordCopyCost * (sum [registerSize r | r <- rARGS]) + jumpCost
+    returnAddressSaveCost + byteSetCost * registerMetadataSize * REGISTERS +
+    wordCopyCost * (sum [registerSize r | r <- rARGS])
+    + jumpCost + callStackDepthCheckCost
+  memoryDelta(LOCALCALL(_, nARGS, _) _ rARGS) =
+    currentRegisterMemory + sum [registerSize(r) | r <- rARGS]
+    + returnAddressSize -- return address
+    + registerMetadataSize * REGISTERS -- unused register table
   ```
+
+  `REGISTERS` is the maximum number of registers as declared in the contract
+  prefix. TODO: Use the caller's actual register count or callee's max register
+  count instead.
 
 * `RETURN`
   Copy values from return registers to caller locations restore local context,
@@ -390,24 +409,286 @@ We assume that all operations interrogating the local state have complexity
   ```hs
   computationCost(RETURN(nRETURNS) rVALUES) =
     restoreContextCost + metadataCopyCost * nRETURNS + jumpCost
-  requiredRegisterMemory = callerRegisterMemory +
+  requiredRegisterMemory(RETURN(nRETURNS) rVALUES) = callerRegisterMemory +
     sum [registerLoadDelta(r, v) | (r, v) <- getReturns() `zip` rVALUES]
   ```
 
-#### `STOP` and `REVERT`
+#### `RETURN` (account call version), `INVALID`, `STOP`, `REVERT` and exceptions
 
-* `STOP`
+A `RETURN` is a an account call one if the call stack is empty.
+
+`INVALID` generates an exception in the callee, whose cost is pre-paid.
+
+`STOP` is an explicit instruction, but reaching the end of a function would
+also do an implicit stop. `STOP` has `0` actual return values.
+
+For `STOP`, `RETURN` and `REVERT`: if the actual return values count is
+different fron the expected return value count, the caller experiences an
+exception, in which case one should use the exception-tagged cost. Note that
+in such cases it does not make sense to set the output values and return code
+since the exception means that the caller can't handle them.
+
+All the costs below are billed to the caller and not taken out of the callee
+gas limit. The `- exceptionCost` part refers to the callee prepaid exception
+cost which is being refunded since any possible exception belongs to the caller.
+
+* `INVALID` and exceptions in general
   ```hs
-  computationCost(STOP) = stopCost() -- defined in terms of the current execution context
+  computationCost(INVALID|exception) = 0
+  ```
+* `STOP`.
+  ```hs
+  computationCost(STOP) =
+    environmentRestoreCost(with-world) + wordCopyCost * (registersize 1) +
+    refundCost + returnValueCountComparisonCost - exceptionCost
+  computationCost(exception, STOP) =
+    environmentRestoreCost(with-world) + refundCost +
+    returnValueCountComparisonCost - exceptionCost
   ```
 * `REVERT`
   ```hs
-  computationCost(REVERT(nRETURNS) rVALUES) = wordCopyCost * registerSize(rValues) +
-    revertCost() -- defined in terms of the current execution context.
+  computationCost(REVERT(nRETURNS) rVALUES) =
+    environmentRestoreCost + wordCopyCost * (registersize 0) +
+    wordCopyCost * sum [registerSize(r) | r <- rVALUES] +
+    returnValueCountComparisonCost - exceptionCost
+  computationCost(exception, REVERT(nRETURNS) rVALUES) =
+    environmentRestoreCost + returnValueCountComparisonCost - exceptionCost
   ```
+* `RETURN`
+  ```hs
+  computationCost(RETURN(nRETURNS) rVALUES) =
+    environmentRestoreCost + wordCopyCost * (registersize 0) +
+    wordCopyCost * sum [registerSize(r) | r <- rVALUES] +
+    returnValueCountComparisonCost - exceptionCost
+  computationCost(exception, RETURN(nRETURNS) rVALUES) =
+    environmentRestoreCost + returnValueCountComparisonCost - exceptionCost
+  ```
+
+environmentRestoreCost is the cost of re-establishing the callStack, worldState
+and subState pointers to what they were before the current contract call.
+
+TODO: Do we count any cost for freeing memory? This occurs at any operation
+which resizes a register or a memory value, but it's most obvious at calls,
+returns and similar things. I guess that it's better to include the memory
+freeing cost in the allocation cost since all memory seems to be freed after the
+top call finishes. We should check that this is the case.
 
 TODO:  Figure out more precise costs for these
 
+#### `CALL`, `CALLCODE`, `DELEGATECALL` and `STATICCALL`
+* `CALL`, `CALLCODE`, `DELEGATECALL` and `STATICCALL`
+  A call is split in several parts. There are some checks which are done before
+  everything else (account ammount and call depth), which may finish everything
+  with an exception. These (including the exception) have an O(1) cost. Here the
+  execution splits in three cases:
+  * The called account does not exist -> we continue executing an empty code,
+     which has only an empty "deposit" function, without any
+     end/return/whatever. TODO: What happens when executing an empty function?
+  * The account exists, but the code is not loaded. The code is assumed to be
+     in a format suitable for execution. This has a cost in O(code size).
+  * There are some special accounts with 'precompiled' code. Calls to these
+     accounts are likely to resolve to native calls. These are not handled
+     below because they are likely to have completely different cost structure.
+     TODO: handle precompiled code.
+
+  After loading the code there are more checks and setup work. The checks
+  (the function exists and the argument count matches) can end with an
+  exception. These checks are done at the end in the semantics, but I am
+  assuming that they can be moved earlier.
+
+  Here are the parameters relevant to `CALL` with a bit more detail than needed.
+  * `REG` is the error code.
+  * `REGS` are the return registers.
+  * `ARGS` are the arguments.
+  * `GCAP` is the gas limit.
+  * `VALUE` is the amount to transfer.
+  * `APPVALUE` can be read by a contract with `CALLVALUE` and, unless specified
+               otherwise, is equal to `VALUE`.
+  * `ACCTFROM` is the current account, by default making the call and making the
+               payments.
+  * `ACCTO` is explained below.
+  * `ACCTAPPFROM` is relevant for `DELEGATECALL` and it's the account calling
+                  the contract which contains `DELEGATECALL`.
+
+Here are the differences between the various calls.
+
+* `CALL` loads the code from `ACCTO`, runs it as `ACCTO` and pays `ACCTO`.
+* `CALLCODE` loads the code from `ACCTO` and runs it as `ACCFROM` and pays
+             `ACCFROM`.
+* `DELEGATECALL` makes the call as `ACCTAPPFROM`, loads the code from `ACCTO`
+                 and runs it as `ACCFROM`. Pays `0` to `ACCFROM`, `APPVALUE`
+                 is `CALLVALUE`.
+* `STATICCALL` loads the code from `ACCTO`, runs it as `ACCTO` and pays `0` to
+               `ACCTO`. `APPVALUE` is also `0`.
+
+Below I'll assume that no payment actually happens for `CALLCODE`,
+`DELEGATECALL` and `STATICCALL`. I'll also assume that calls to an inexistent
+account (which will be created) are executed without an actual call, since
+the only available function is an empty 'deposit'.
+
+If the contract code contains a function index when stored, then one does not
+need to load the entire code in order to fail with a function check. However,
+we should not optimize for the error case, so the question becomes what is
+more efficient for the non-error case. That is not trivial to answer, but for
+now we can "hide" this cost in the codeLoadingCost/codeByteLoadingCost values,
+and we'll make the error case less efficient.
+TODO: Clarify codeLoadingCost/codeByteLoadingCost.
+
+Although the caller pays for code loading one way or another, one may argue
+that this should be paid from the `GCAP`. However, it seems conceptually easier
+to consider that `GCAP` pays for the running cost of the contract, so it will
+not include the code loading cost.
+
+Also, it may seem counterintuitive to pay for the code loading cost, one may
+expect to pay a flat fee as in the EVM model. A flat fee is usually less
+efficient, so we're using a size-based fee. There is a similar memory
+consumption associated with loading the code which, arguably, might be included
+in a flat-fee cost.
+
+  ```hs
+  -- CALLOP in [CALL, CALLCODE, DELEGATECALL, STATICCALL]
+
+  computationCost(early-failing, CALLOP(LABEL,_,_) REG GCAP ACCTTO VALUE REGS ARGS) =
+    initialCallCheckCost(CALLOP) + errorCodeSettingCost
+  computationCost(not-early-failing, CALLOP(LABEL,_,_) REG GCAP ACCTTO VALUE REGS ARGS) =
+    initialCallCheckCost(CALLOP) + computationCost(#callWithCode(....))
+
+  computationCost(inexistent-acccount-late-failure, #callWithCode(...)) =
+    accountTypeCheckCost + methodCallCheckCost + errorSettingCost
+  computationCost(existent-acccount-late-failure, #callWithCode(...)) =
+    accountTypeCheckCost + codeLoadingCost + methodCallCheckCost +
+    errorSettingCost
+
+  computationCost(inexistent-account, #callWithCode(...)) =
+    accountTypeCheckCost + methodCallCheckCost + newAccountSetupCost(CALLOP)
+  computationCost(existent-account, #callWithCode(...)) =
+    accountTypeCheckCost + codeLoadingCost + methodCallCheckCost +
+    callStateSavingCost + accountTransferCost(CALLOP) + constantCallSetupCost +
+    callDataSetupCost + callFeeCost + exceptionCost
+
+  codeLoadingCost = codeByteLoadingCost * codeSize
+  callDataSetupCost = wordCopyCost * callDataSize
+  callDataSize = sum [registerSize r | r <- rARGS]
+
+  initialCallCheckCost(CALL) = accountValueCheckCost + stackCheckCost
+  initialCallCheckCost(CALLCODE|DELEGATECALL|STATICCALL) = stackCheckCost
+
+  accountTransferCost(CALL) = accountTransferCost
+  accountTransferCost(CALLCODE|DELEGATECALL|STATICCALL) = 0
+
+  newAccountSetupCost(CALL) = accountCreationCost + accountTransferCost
+  newAccountSetupCost(CALLCODE|DELEGATECALL|STATICCALL) = 0
+
+  -- Memory increase/decrease follows a similar pattern
+
+  memoryDelta(early-failling, CALLOP) =
+      registerSize 0 - registerSize REG
+  memoryDelta(inexistent-account-late-failure) =
+      registerSize 0 - registerSize REG
+  memoryDelta(inexistent-account-success) = 0
+      registerSize 0 - registerSize REG
+
+  -- Temporary memory increase, i.e. the memory increases until the error is
+  -- detected, then it goes back to its initial value. I.e. it might be a good
+  -- idea to just update the max memory usage (if needed) and not the currently
+  -- used memory.
+  memorySpikeSize(existent-account-late-failure) = codeSize
+  -- The spike is followed by a normal memory delta.
+  memoryDelta(existent-account-late-failure) =
+      registerSize 0 - registerSize REG
+
+  memoryDeltaCaller(existent-account-success) = codeSize + constantMemorySize
+  memorySizeCallee(existent-account-success) = callDataSize
+  ```
+
+  The calee starts with a memory usage of memorySizeCallee (absolute, not a
+  delta). There is a free memory allowance for each new contract call, equal to
+  the maximum EVM stack size, that will be taken into account separately.
+
+  `constantMemorySize` is the size of whatever is part of the saved state
+  except for the code and callData (calldepth, callValue, id, gas, caller,
+  static)
+
+TODO: I (virgil) think that these costs are more reasonable than some costs
+      which follow the semantics in detail. However, we should be able to use
+      them inside the semantics, so we should make sure that this is possible.
+
+TODO: CALL loads some data in `<callData>`, but that's not used anywhere.
+      Above I included a possible definition (`callDataSetupCost`), but we
+      should find out what happens to that and include the right cost.
+
+TODO: Is the callFeeCost fixed or based on the stack size?
+
+TODO: Returning can be either implicit or explicit, should take that into
+      account
+
+#### Exception costs
+
+Many things generate exceptions, including being out of gas, which means that
+there may not be any gas left to pay for the exception. Therefore it is
+preferable that all exception handling costs are pre-paid by `CALL`-like
+operations and returned by `RETURN`-like operations. TODO: Make sure that this
+actually happens.
+
+```hs
+exceptionCost = environmentRestoreCost + wordCopyCost * (registersize 0)
+```
+
+#### Builtin calls costs
+* `ECREC` - ECDSA public key recovery. http://www.secg.org/sec1-v2.pdf section
+  4.1.6
+
+  ```hs
+  computationCost(ECREC) = ecrecCost + keyCopyCost  -- 3000 for EVM
+  ```
+* `SHA256`
+  ```hs
+  -- 60 + 12 * upper(len(data)/32) for EVM
+  computationCost(SHA256(LEN, DATA)) =
+    builtinCallConstantCost +
+    sha256ConstantCost + sha256ChunkCost * upper(max(len, log256(data))/32) +
+    32 * byteCopyCost -- hashCopyCost
+  ```
+  TODO: can `len` be less than `log256(data)`?
+* `RIP160`
+  ```hs
+  -- 600 + 120 * upper(len(data)/32) for EVM
+  computationCost(RIP160(LEN, DATA)) =
+    builtinCallConstantCost +
+    rip160ConstantCost + rip160ChunkCost * upper(max(len, log256(data))/32) +
+    20 * byteCopyCost -- hashCopyCost
+  ```
+* `ID`
+  ```
+  -- 15 + 3 * upper(len(data)/32) for EVM
+  computationCost(ID(DATA)) =
+    builtinCallConstantCost +
+    byteCopyCost * log256(DATA)
+  ```
+* `ECADD`
+  ```
+  -- 500 in the Byzantium EVM semantics
+  computationCost(ECADD(X,Y,Z)) =
+    builtinCallConstantCost +
+    ecAddComputationCost +
+    64 * byteCopyCost -- result, 2x32-byte coordinates
+  ```
+* `ECMUL`
+  ```
+  -- 40000 in the Byzantium EVM semantics
+  computationCost(ECMUL(X,Y,Z)) =
+    builtinCallConstantCost +
+    ecMulComputationCost +
+    64 * byteCopyCost -- result, 2x32-byte coordinates
+  ```
+* `ECPAIRING`
+  ```
+  -- 100000 +Int (#sizeWordStack(DATA) /Int 192) *Int 80000  in the Byzantium EVM semantics
+  computationCost(ECPAIRING(DATA)) =
+    builtinCallConstantCost +
+    ecPairingConstantCost + upper(log256(DATA)/192) * ecPairingChunkCost +
+    32 * byteCopyCost -- result copy cost
+  ```
 
 #### Logging
 We use the same schema from the yellow paper, but taking into account the size
@@ -443,6 +724,13 @@ of the logged registers.
   computationCost(MLOAD rREG wINDEX) = mLoadCost + mloadWordCost * memoryCellSize(value wIndex)
   estimatedResultSize(MLOAD rREG wINDEX) = memoryCellSize(value wIndex)
   ```
+* `MLOADN`
+  ```hs
+  computationCost(MLOADN rREG, wINDEX1, wINDEX2, wWIDTH) =
+    mLoadNCost + mLoadWordCost * wWIDTH
+  memoryDelta(MLOADN rREG, wINDEX1, wINDEX2, wWIDTH) =
+    wWIDTH - registerSize rREG
+  ```
 * `MSTORE` when we store a new value over an old one, we compute the difference
   in size between the two values.  Similar to changes to registers, this difference is used to update the
   current memory requirements, and, if it increases, it might update the top
@@ -454,15 +742,57 @@ of the logged registers.
   memoryCost(MSTORE wINDEX wVALUE) =
     (registerSize wVALUE - storeCellSize(value wIndex))
   ```
+* `MSTOREN`
+  ```hs
+  computationCost(MSTOREN wINDEX1 wINDEX2 wVALUE wWIDTH) =
+    mStoreNCost +
+    mStoreWordCost * max(0, wINDEX2 - storeCellSize(value wIINDEX1))
+    mStoreWordCost * wWIDTH
+  memoryDelta(MSTOREN wINDEX1 wINDEX2 wVALUE wWIDTH) =
+    wWIDTH + max(0, wINDEX2 - storeCellSize(value wIINDEX1))
+  ```
 
+#### Register manipulations
+* `MOVE` copies a value from one register to another
+  ```hs
+  computationcost(MOVE(destREG, sourceREG)) =
+      wordCopyCost * registerSize(sourceREG)
+  memoryDelta(MOVE(destREG, sourceREG)) =
+      registerSize(sourceREG) - registerSize(destREG)
+  ```
+* `LOADPOS` loads an immediate (positive) value into a register
+  ```hs
+  computationcost(LOADPOS(destREG, SOURCE)) =
+      wordCopyCost * registerSize(SOURCE)
+  memoryDelta(LOADPOS(destREG, SOURCE)) =
+      registerSize(SOURCE) - registerSize(destREG)
+  ```
+* `LOADNEG` loads an immediate (positive) value into a register, negating it
+  first.
 
+  This assumes either a sign + number representation or a two's complement
+  with the source already in that form.
+
+  ```hs
+  computationcost(LOADPOS(destREG, SOURCE)) =
+      wordCopyCost * registerSize(SOURCE) + wordCost
+  memoryDelta(LOADPOS(destREG, SOURCE)) =
+      registerSize(SOURCE) - registerSize(destREG)
+  ```
 
 #### Account operations
 
 * `BALANCE`
   ```hs
-  computationCost(BALANCE) = balanceCost
+  computationCost(existing-account, BALANCE) = balanceCost
+  computationCost(non-existing-account, BALANCE) = newAccountCost + balanceCost
   estimatedResultSize(BALANCE) = balanceSize
+  ```
+* `EXTCODESIZE`
+  ```hs
+  computationCost(existing-account, EXTCODESIZE) = extCodeSizeCost
+  computationCost(non-existing-account, EXTCODESIZE) = newAccountCost + extCodeSizeCost
+  estimatedResultSize(EXTCODESIZE) = extCodeSizeSize
   ```
 * `SLOAD` In order to load the data from the storage, we first need to inspect
   the metadata to make sure we have enough gas to load it.  Hence, we will
@@ -482,6 +812,59 @@ of the logged registers.
   storeCost(SSTORE wINDEX wVALUE) =
     refundableStoreCost * (registerSize wVALUE - storeCellSize(value wIndex))
   ```
+
+#### Account creation and destruction
+
+* `CREATE`
+  ```hs
+  computationCost(early-failing, CREATE) =
+    checkCreateCost + errorCodeSettingCost
+  computationCost(new-account-failing, CREATE) =
+    checkCreateCost + checkExistingNonemptyAccountCost + errorCodeSettingCost
+  computationCost(new-account-failing, CREATE) =
+    checkCreateCost + checkExistingNonemptyAccountCost + mapLookupCost +
+    checkCodeLengthCost + errorCodeSettingCost
+
+  computationCost(success, CREATE) =
+    checkCreateCost + checkExistingNonemptyAccountCost + mapLookupCost +
+    checkCodeLengthCost + createCostWithoutChecks + [depositCostWithoutChecks]
+
+  checkCreateCost = initialCallCheckCost(CALL)
+  newAddrCost = constant
+  createCostWithoutChecks =
+    contextSaveCost + newAccountWithoutChecksCost + accountTransferCost +
+    mkCreateCost + exceptionCost
+  newAccountWithoutChecksCost = constant
+  mkCreateCost = mkCreateConstantCost + initVMCost + initFunCost +
+    codeLoadingCost
+  -- TODO: the same cost exists for calls.
+  initVMCost = wordCopyCost * (sum [registerSize r | r <- rARGS]) + clearVMCost
+  -- TODO: the same cost exists for calls.
+  -- initFunCost = checkFunctionExistence + checkArgCountMatch +
+  --   constantInitFunCost
+
+  depositCostWithoutChecks = constant -- TODO - runs at the #end
+  ```
+* `SELFDESTRUCT`
+  TODO: Should selfDestructFinalizeTxCost be paid when there is an exception?
+  Do we care?
+  ```hs
+  computationCost(diff-account, SELFDESTRUCT) =
+    accountTransferCost + comparisonCost + setInsertCost +
+    refundComputationCost + selfDestructFinalizeTxCost
+  computationCost(same-account, SELFDESTRUCT) =
+    comparisonCost + setInsertCost + refundComputationCost +
+    selfDestructFinalizeTxCost
+  ```
+* `COPYCREATE`
+  TODO: There may be a difference in costs, but it's hard to check before
+  Dwight finishes his fix for the case when there is no ACCTCODE.
+  The only difference is that the map lookup for the code above is replaced by
+  the ACCTCODE lookup, and the lookup failure case may be different.
+  ```hs
+  computationCost(X, COPYCREATE) = computationCost(X, CREATE)
+  ```
+
 
 Definitions
 -----------
@@ -551,3 +934,28 @@ Definitions
 
 * Check that GMP can check for 0 in constant time or update costs accordingly
 * Check that GMP can give number of limbs in constant time or update costs accordingly
+* Check that all background costs are accounted for (e.g. updating a register's)
+  metadata after an assignment.
+* Check that memory deltas are used properly everywhere (e.g. MLOAD).
+* Bill each use of #newAccount as using account storage space.
+* Account for #finalizeTx costs somehow.
+
+
+### TODOS: Instructions to consider if they should be added
+
+* REGISTERS
+* FUNCTION
+
+### TODOS: Make sure we don't need these
+
+* CALLDATALOAD
+* CALLDATASIZE
+* CALLDATACOPY
+* LOCALRETURN
+* LOCALCALLI
+* CALLDEST
+* EXTCALLDEST
+* RETURNDATASIZE
+* RETURNDATACOPY
+* CODECOPY
+* EXTCODECOPY
